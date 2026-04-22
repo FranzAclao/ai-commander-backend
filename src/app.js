@@ -1,65 +1,93 @@
 const express = require("express");
-const Joi = require("joi");
-const { Incident } = require("./models");
+const config = require("./config");
+const { createHealthRouter } = require("./routes/health");
+const { createMeRouter } = require("./routes/me");
+const { createNotificationsRouter } = require("./routes/notifications");
+const { createQueryRouter } = require("./routes/query");
+const { createResultRouter } = require("./routes/result");
+const { createOrdersRouter } = require("./routes/orders");
+const { createAlertsRouter } = require("./routes/alerts");
+const { createSavedQueriesRouter } = require("./routes/savedQueries");
+const { createAccountRouter } = require("./routes/account");
+const { createLivekitRouter } = require("./routes/livekit");
+const { createAgentJoinRouter } = require("./routes/agentJoin");
+const { createActivityRouter } = require("./routes/activity");
 
 function createApp() {
   const app = express();
+  app.set("etag", false);
+
+  const allowedOrigins = String(config.corsOrigin || "*")
+    .split(",")
+    .map((o) => o.trim())
+    .filter(Boolean);
+
+  app.use((req, res, next) => {
+    const requestOrigin = req.headers.origin;
+
+    if (!requestOrigin) {
+      return next();
+    }
+
+    const allowAll = allowedOrigins.includes("*");
+    const isAllowed = allowAll || allowedOrigins.includes(requestOrigin);
+
+    if (isAllowed) {
+      res.setHeader("Access-Control-Allow-Origin", allowAll ? "*" : requestOrigin);
+      res.setHeader("Vary", "Origin");
+    }
+
+    res.setHeader(
+      "Access-Control-Allow-Methods",
+      "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+    );
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      "Content-Type, Authorization, X-Conversation-Id"
+    );
+    res.setHeader("Access-Control-Expose-Headers", "X-Conversation-Id");
+
+    if (req.method === "OPTIONS") {
+      return res.sendStatus(204);
+    }
+
+    return next();
+  });
+
+  app.use((req, res, next) => {
+    console.log(`[req] ${req.method} ${req.path}`);
+    next();
+  });
+
+  app.use((req, res, next) => {
+    if (req.path === "/health" || (req.path && req.path.startsWith("/api"))) {
+      res.setHeader("Cache-Control", "no-store");
+    }
+    next();
+  });
 
   app.use(express.json());
 
-  app.get("/health", (req, res) => {
-    res.json({ ok: true });
-  });
-
-  app.get("/api/incidents", async (req, res, next) => {
-    try {
-      const incidents = await Incident.findAll({
-        order: [["createdAt", "DESC"]],
-      });
-      res.json({ incidents });
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  app.get("/api/incidents/:id", async (req, res, next) => {
-    try {
-      const incident = await Incident.findByPk(req.params.id);
-      if (!incident) {
-        return res.status(404).json({ error: "incident_not_found" });
-      }
-      return res.json({ incident });
-    } catch (error) {
-      next(error);
-    }
-  });
-
-  const agentQuerySchema = Joi.object({
-    incidentId: Joi.string().guid({ version: "uuidv4" }).optional(),
-    query: Joi.string().min(1).required(),
-  });
-
-  app.post("/api/agent/query", (req, res) => {
-    const { value, error } = agentQuerySchema.validate(req.body, {
-      abortEarly: false,
-      stripUnknown: true,
-    });
-
-    if (error) {
-      return res.status(400).json({
-        error: "invalid_request",
-        details: error.details.map((d) => d.message),
-      });
-    }
-
-    return res.json({
-      message: "Agent query received (stubbed in Batch 1).",
-      received: value,
-    });
-  });
+  app.use(createHealthRouter());
+  app.use(createMeRouter());
+  app.use(createNotificationsRouter());
+  app.use(createQueryRouter());
+  app.use(createResultRouter());
+  app.use(createOrdersRouter());
+  app.use(createAlertsRouter());
+  app.use(createSavedQueriesRouter());
+  app.use(createAccountRouter());
+  app.use(createActivityRouter());
+  app.use(createLivekitRouter());
+  app.use(createAgentJoinRouter());
 
   app.use((req, res) => {
-    res.status(404).json({ error: "not_found" });
+    if (req.path && req.path.startsWith("/api")) {
+      return res
+        .status(404)
+        .json({ error: "Unknown API endpoint", path: req.originalUrl });
+    }
+    return res.status(404).json({ error: "not_found" });
   });
 
   app.use((err, req, res, next) => {
