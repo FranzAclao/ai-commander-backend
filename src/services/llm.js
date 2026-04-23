@@ -76,7 +76,20 @@ async function safeReadBodyText(res) {
   }
 }
 
-async function callOllama(prompt, { options, stop } = {}) {
+function normalizeOllamaMessages(messages) {
+  if (!Array.isArray(messages)) return [];
+  return messages
+    .map((m) => {
+      const role = m && typeof m.role === "string" ? m.role.trim() : "";
+      const content = m && typeof m.content === "string" ? m.content : "";
+      if (!role || !content) return null;
+      if (role !== "user" && role !== "assistant" && role !== "system") return null;
+      return { role, content: String(content) };
+    })
+    .filter(Boolean);
+}
+
+async function callOllamaChat(messages, { options, stop } = {}) {
   const model = ollamaModelName();
   if (!model) {
     throw new LlmError("OLLAMA_MODEL must be set when using Ollama.", {
@@ -94,9 +107,17 @@ async function callOllama(prompt, { options, stop } = {}) {
       ...(options && typeof options === "object" ? options : {}),
     };
 
+    const normalizedMessages = normalizeOllamaMessages(messages);
+    if (!normalizedMessages.length) {
+      throw new LlmError("Ollama chat messages are required.", {
+        code: "ollama_invalid_messages",
+        status: 400,
+      });
+    }
+
     const payload = {
       model,
-      prompt,
+      messages: normalizedMessages,
       stream: false,
       options: mergedOptions,
     };
@@ -105,7 +126,7 @@ async function callOllama(prompt, { options, stop } = {}) {
       payload.stop = stop;
     }
 
-    const res = await fetch(`${ollamaBaseUrl()}/api/generate`, {
+    const res = await fetch(`${ollamaBaseUrl()}/api/chat`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(payload),
@@ -122,7 +143,10 @@ async function callOllama(prompt, { options, stop } = {}) {
     }
 
     const data = await res.json();
-    const out = data && (data.response || data.output || "");
+    const out =
+      (data && data.message && (data.message.content || data.message)) ||
+      (data && (data.response || data.output)) ||
+      "";
     return String(out || "").trim();
   } catch (err) {
     if (err && err.name === "AbortError") {
@@ -142,6 +166,10 @@ async function callOllama(prompt, { options, stop } = {}) {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+async function callOllama(prompt, opts) {
+  return callOllamaChat([{ role: "user", content: String(prompt || "") }], opts);
 }
 
 async function callLlm(prompt, opts) {
@@ -199,6 +227,8 @@ async function summarizeRows({ question, sql, rows, history }) {
     "- Be concise (2-6 sentences).",
     "- Mention key numbers or trends you see.",
     "- If there are no rows, say that clearly and suggest a next query.",
+    "- Do not infer business facts that are not present in the rows. For example, a single aggregate row does NOT imply that all underlying records were successful/paid.",
+    "- If the user asks for a breakdown that the rows don't contain (e.g., payment status mix), suggest a concrete follow-up query (e.g., group by status).",
     "",
     history ? String(history) : "",
     "",
@@ -215,8 +245,38 @@ async function summarizeRows({ question, sql, rows, history }) {
   return callLlm(prompt, { options: { num_predict: 256 } });
 }
 
-async function answerQuestion({ question, history }) {
+async function answerQuestion({ question, history, messages }) {
   const q = String(question || "").trim();
+
+  const provider = getLlmProvider();
+  if (provider === "ollama") {
+    const system = [
+      "You are InsightCopilot, a helpful assistant.",
+      "Answer the user's message conversationally.",
+      "",
+      "Guidelines:",
+      "- Be concise (1-6 sentences).",
+      "- If the user is just acknowledging or saying thanks, respond politely and do not summarize prior analytics unless they explicitly ask.",
+      "- If the user is asking for analytics, suggest how to ask it as a concrete question (e.g., totals, breakdowns, date ranges).",
+      "- If the user is not asking for analytics, answer normally.",
+      "- Do not output SQL.",
+    ].join("\n");
+
+    const outMessages = [{ role: "system", content: system }];
+
+    if (Array.isArray(messages) && messages.length) {
+      outMessages.push(...messages);
+    } else if (history) {
+      // Fallback: inject text history as a system note.
+      outMessages.push({ role: "system", content: String(history) });
+    }
+
+    outMessages.push({ role: "user", content: q });
+
+    // Keep chat responses snappy; analytics paths use separate SQL+summary prompts.
+    return callOllamaChat(outMessages, { options: { num_predict: 96 } });
+  }
+
   const prompt = [
     "You are InsightCopilot, a helpful assistant.",
     "Answer the user's message conversationally.",
@@ -235,7 +295,6 @@ async function answerQuestion({ question, history }) {
     "Assistant:",
   ].join("\n");
 
-  // Keep chat responses snappy; analytics paths use separate SQL+summary prompts.
   return callLlm(prompt, { options: { num_predict: 96 } });
 }
 
@@ -279,7 +338,13 @@ async function prewarmLlm() {
 
   try {
     // Trigger a tiny generation so Ollama loads the model into memory.
-    await callOllama("Say 'ready'.", { options: { num_predict: 1 } });
+    await callOllamaChat(
+      [
+        { role: "system", content: "Respond with a single word." },
+        { role: "user", content: "ready" },
+      ],
+      { options: { num_predict: 1 } }
+    );
     return { ok: true, provider };
   } catch (err) {
     return { ok: false, provider, error: err };

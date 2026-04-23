@@ -80,6 +80,25 @@ function historyText(idRaw) {
   return lines.join("\n");
 }
 
+function historyMessages(idRaw, { maxTurns = 8 } = {}) {
+  const convo = getConversation(idRaw);
+  if (!convo || !Array.isArray(convo.turns) || convo.turns.length === 0) return [];
+
+  const limit = Number.isFinite(maxTurns) ? Math.max(0, maxTurns) : 8;
+  const turns = convo.turns.slice(-limit);
+  const messages = [];
+
+  for (const t of turns) {
+    const user = (t && t.user ? String(t.user) : "").trim();
+    const assistant = (t && t.assistant ? String(t.assistant) : "").trim();
+
+    if (user) messages.push({ role: "user", content: user });
+    if (assistant) messages.push({ role: "assistant", content: assistant });
+  }
+
+  return messages;
+}
+
 function lastTurn(idRaw) {
   const convo = getConversation(idRaw);
   if (!convo || !Array.isArray(convo.turns) || convo.turns.length === 0) return null;
@@ -89,5 +108,6 @@ function lastTurn(idRaw) {
 module.exports = {
   appendTurn,
   historyText,
+  historyMessages,
   lastTurn,
 };

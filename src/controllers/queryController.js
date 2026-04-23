@@ -9,7 +9,12 @@ const {
   answerQuestion,
   repairSelectSql,
 } = require("../services/llm");
-const { appendTurn, historyText, lastTurn } = require("../services/conversationStore");
+const {
+  appendTurn,
+  historyText,
+  historyMessages,
+  lastTurn,
+} = require("../services/conversationStore");
 
 const requestSchema = Joi.object({
   question: Joi.string().min(1).max(2000).required(),
@@ -91,6 +96,21 @@ ORDER BY b.bucket_start ASC;
   `.trim();
 }
 
+function paymentsStatusBreakdownSql(days) {
+  const n = Number.isFinite(days) ? Math.max(1, Math.min(3650, days)) : 30;
+  return `
+SELECT
+  p.status AS status,
+  COALESCE(COUNT(*), 0)::double precision AS count,
+  COALESCE(SUM(p.amount), 0)::double precision AS total_amount
+FROM payments p
+WHERE p.paid_at >= NOW() - INTERVAL '${n} days'
+GROUP BY p.status
+ORDER BY count DESC, status ASC
+LIMIT 200;
+  `.trim();
+}
+
 function isVisualizationFollowupQuestion(question) {
   const q = String(question || "").trim().toLowerCase();
   if (!q) return false;
@@ -116,6 +136,26 @@ function isVisualizationFollowupQuestion(question) {
     q.includes("store");
 
   return !hasMetricCue && q.length <= 80;
+}
+
+function isPaymentsStatusFollowupQuestion(question) {
+  const q = String(question || "").trim().toLowerCase();
+  if (!q) return false;
+
+  // Follow-ups like: "are all of those paid?", "were they all successful?"
+  const asksAll =
+    /\b(are|were)\b/.test(q) && (q.includes("all") || q.includes("any"));
+  const asksStatus =
+    q.includes("paid") ||
+    q.includes("successful") ||
+    q.includes("success") ||
+    q.includes("succeeded") ||
+    q.includes("failed") ||
+    q.includes("refunded") ||
+    q.includes("pending") ||
+    q.includes("status");
+
+  return q.length <= 140 && asksAll && asksStatus;
 }
 
 function topicFromLastTurn(t) {
@@ -159,6 +199,71 @@ function shouldUseSalesTrend30dPreset(question) {
   const wantsStoreBreakdown = q.includes("by store") || q.includes("per store");
 
   return mentionsSales && mentions30Days && wantsVisual && !wantsStoreBreakdown;
+}
+
+function parseLastNDays(question) {
+  const q = String(question || "").trim().toLowerCase();
+  const m = q.match(/\b(last|past|previous)\s+(\d+)\s*day(s)?\b/i);
+  if (!m) return null;
+  const n = Number(m[2]);
+  if (!Number.isFinite(n)) return null;
+  if (n <= 0) return null;
+  return Math.min(3650, Math.floor(n));
+}
+
+function inferDaysFromTurn(previousTurn) {
+  const user = (previousTurn && previousTurn.user ? String(previousTurn.user) : "").trim();
+  const sql = (previousTurn && previousTurn.sql ? String(previousTurn.sql) : "").trim();
+
+  const fromUser = parseLastNDays(user);
+  if (fromUser) return fromUser;
+
+  const sqlLower = sql.toLowerCase();
+  const m = sqlLower.match(/interval\s+'(\d+)\s*day/i);
+  if (m) {
+    const n = Number(m[1]);
+    if (Number.isFinite(n) && n > 0) return Math.min(3650, Math.floor(n));
+  }
+
+  return 30;
+}
+
+function shouldUsePaymentsTotalPreset(question) {
+  const q = String(question || "").trim().toLowerCase();
+  if (!q) return false;
+
+  const mentionsPayments = /\bpayments?\b/.test(q);
+  const mentionsTotal =
+    /\b(total|sum)\b/.test(q) || q.includes("how much") || q.includes("overall");
+  const days = parseLastNDays(q);
+  const hasExplicitTime = Boolean(days) || mentionsTimeRange(q);
+  const wantsVisual =
+    q.includes("visual") ||
+    q.includes("visualize") ||
+    q.includes("chart") ||
+    q.includes("graph") ||
+    q.includes("trend") ||
+    q.includes("over time") ||
+    q.includes("time series") ||
+    q.includes("timeseries");
+  const wantsBreakdown =
+    q.includes("break down") ||
+    q.includes("breakdown") ||
+    q.includes("group by") ||
+    q.includes("by store") ||
+    q.includes("per store");
+
+  return mentionsPayments && mentionsTotal && hasExplicitTime && !wantsVisual && !wantsBreakdown;
+}
+
+function paymentsTotalSql(days) {
+  const n = Number.isFinite(days) ? Math.max(1, Math.min(3650, days)) : 30;
+  return `
+SELECT
+  COALESCE(SUM(p.amount) FILTER (WHERE p.status = 'succeeded'), 0)::double precision AS total_payments
+FROM payments p
+WHERE p.paid_at >= NOW() - INTERVAL '${n} days';
+  `.trim();
 }
 
 function outputHintText(question) {
@@ -670,6 +775,86 @@ function fastSmallTalkResponse(question) {
   return "";
 }
 
+function mentionsTimeRange(question) {
+  const q = String(question || "").trim().toLowerCase();
+  if (!q) return false;
+  if (/\b(last|past|previous)\s+\d+\s*(day|week|month|year)s?\b/i.test(q)) return true;
+  if (/\b(today|yesterday|this\s+week|this\s+month|this\s+year|last\s+week|last\s+month|last\s+year)\b/i.test(q))
+    return true;
+  if (/\bfrom\s+\d{4}-\d{2}-\d{2}\b/i.test(q) || /\bto\s+\d{4}-\d{2}-\d{2}\b/i.test(q))
+    return true;
+  if (/\b\d{4}-\d{2}-\d{2}\b/i.test(q)) return true;
+  return false;
+}
+
+function mentionsMetric(question) {
+  const q = String(question || "").trim().toLowerCase();
+  if (!q) return false;
+  return /\b(sales|revenue|orders?|payments?|visits?|sessions?|alerts?|notifications?|activity|kpi|metrics?)\b/i.test(
+    q
+  );
+}
+
+function mentionsBreakdownDimension(question) {
+  const q = String(question || "").trim().toLowerCase();
+  if (!q) return false;
+  return /\b(by|per)\s+(store|channel|status|day|week|month|year|customer|product|region)\b/i.test(
+    q
+  );
+}
+
+function needsClarificationQuestion(question, previousTurn) {
+  const q = String(question || "").trim().toLowerCase();
+  if (!q) return "";
+  if (previousTurn) return "";
+
+  const wantsVisual =
+    q.includes("visualize") ||
+    q.includes("chart") ||
+    q.includes("graph") ||
+    q.includes("plot") ||
+    q.includes("trend") ||
+    q.includes("over time") ||
+    q.includes("time series") ||
+    q.includes("timeseries");
+
+  const wantsBreakdown =
+    q.includes("break down") ||
+    q.includes("breakdown") ||
+    q.includes("group by") ||
+    /\bby\s+\w+/.test(q);
+
+  const hasMetric = mentionsMetric(q);
+  const hasTime = mentionsTimeRange(q);
+
+  // Follow-ups without context.
+  if ((/\b(it|that|this|those|them)\b/i.test(q) && wantsVisual) || q === "visualize it") {
+    return "What should I visualize (sales, payments, orders, visits), and for what time range (last 7 days, last 30 days, or a date range)?";
+  }
+
+  // Visualization/trend without a time window.
+  if (wantsVisual && !hasTime) {
+    return "What time range should I use for the chart (last 7 days, last 30 days, or a date range)?";
+  }
+
+  // Breakdown without a clear dimension.
+  if ((wantsBreakdown || q.includes("breakdown")) && hasMetric && !mentionsBreakdownDimension(q)) {
+    return "Break it down by what (store, channel, status, or day/week/month)?";
+  }
+
+  // Ranking/top without a metric.
+  if ((q.includes("top") || q.includes("ranking") || q.includes("rank")) && !hasMetric) {
+    return "Top what metric (sales, payments, visits, orders), and for what time range?";
+  }
+
+  // Vague "total" without a metric.
+  if (/\btotal\b/i.test(q) && !hasMetric) {
+    return "Total of what metric (sales, payments, orders, visits), and for what time range?";
+  }
+
+  return "";
+}
+
 function hasAnalyticsCue(question) {
   const q = String(question || "").trim().toLowerCase();
   if (!q) return false;
@@ -712,6 +897,96 @@ function isAcknowledgementOnly(question) {
     /^(thanks|thank\s+you|ty|thx|ok|okay|kk|cool|nice|great|awesome|perfect|got\s+it|understood|makes\s+sense|sounds\s+good|all\s+good)([.!?])?$/i;
 
   return q.length <= 60 && ackRe.test(q);
+}
+
+function routeQuestion({ question, previousTurn }) {
+  const q = String(question || "").trim();
+  const qLower = q.toLowerCase();
+  const clarification = needsClarificationQuestion(qLower, previousTurn);
+  if (clarification) {
+    return { mode: "clarify", message: clarification };
+  }
+
+  // If it doesn't look like an analytics request, treat it as normal chat.
+  if (!hasAnalyticsCue(qLower)) {
+    return { mode: "chat" };
+  }
+
+  return { mode: "sql" };
+}
+
+function businessRuleViolations({ question, sql }) {
+  const q = String(question || "").trim().toLowerCase();
+  const s = String(sql || "").trim().toLowerCase();
+  if (!q || !s) return [];
+
+  const violations = [];
+
+  const asksPayments = /\bpayments?\b/.test(q);
+  const asksSales = /\b(sales|revenue)\b/.test(q);
+  const usesPayments = /\bfrom\s+payments\b|\bjoin\s+payments\b/.test(s);
+  const usesOrders = /\bfrom\s+orders\b|\bjoin\s+orders\b/.test(s);
+
+  const hasSucceeded =
+    /\bstatus\s*=\s*'succeeded'\b/.test(s) ||
+    /\bstatus\s+in\s*\([^)]*'succeeded'[^)]*\)/.test(s);
+
+  const hasPaidFulfilled =
+    /\bstatus\s+in\s*\([^)]*'paid'[^)]*'fulfilled'[^)]*\)/.test(s) ||
+    /\bstatus\s+in\s*\([^)]*'fulfilled'[^)]*'paid'[^)]*\)/.test(s);
+
+  const mentions30Days = /\b30\s*day(s)?\b/i.test(q) || q.includes("last 30 days");
+  const wantsTime = mentionsTimeRange(q) || mentions30Days;
+  const hasPaidAtFilter = /\bpaid_at\b\s*(>=|>|between)\b/.test(s) || s.includes("paid_at >=");
+  const hasPlacedAtFilter = /\bplaced_at\b\s*(>=|>|between)\b/.test(s) || s.includes("placed_at >=");
+
+  if (asksPayments) {
+    if (!usesPayments) {
+      violations.push("Payments questions should query the payments table.");
+    }
+    if (usesPayments && !hasSucceeded) {
+      violations.push("Payments default filter requires payments.status = 'succeeded'.");
+    }
+    if (usesPayments && wantsTime && !hasPaidAtFilter) {
+      violations.push("Payments time windows should filter by payments.paid_at.");
+    }
+  }
+
+  if (asksSales) {
+    if (!usesOrders) {
+      violations.push("Sales questions should query the orders table.");
+    }
+    if (usesOrders && !hasPaidFulfilled) {
+      violations.push("Sales default filter requires orders.status IN ('paid','fulfilled').");
+    }
+    if (usesOrders && wantsTime && !hasPlacedAtFilter) {
+      violations.push("Sales time windows should filter by orders.placed_at.");
+    }
+  }
+
+  return violations;
+}
+
+async function maybeRepairForBusinessRules({
+  schema,
+  question,
+  sql,
+  outputHint,
+  history,
+}) {
+  const violations = businessRuleViolations({ question, sql });
+  if (!violations.length) return sql;
+
+  const repairedRaw = await repairSelectSql({
+    schema,
+    question,
+    sql,
+    dbError: `Business rule validation failed:\n- ${violations.join("\n- ")}`,
+    outputHint,
+    history,
+  });
+
+  return repairedRaw;
 }
 
 function rememberConversationTurn(conversationId, question, payload) {
@@ -767,6 +1042,7 @@ async function handleQuery(req, res, next) {
   const conversationId =
     conversationIdRaw || headerConversationId || fallbackConversationId(req);
   const history = conversationId ? historyText(conversationId) : "";
+  const historyMsgs = conversationId ? historyMessages(conversationId) : [];
   const previousTurn = conversationId ? lastTurn(conversationId) : null;
 
   if (conversationId) {
@@ -805,7 +1081,8 @@ async function handleQuery(req, res, next) {
 
     if (isSmallTalkQuestion(question)) {
       const summary =
-        fastSmallTalkResponse(question) || (await answerQuestion({ question, history }));
+        fastSmallTalkResponse(question) ||
+        (await answerQuestion({ question, history, messages: historyMsgs }));
       const payload = { sql: "", rows: [], summary, conversationId };
       rememberConversationTurn(conversationId, question, payload);
       return res.json(payload);
@@ -814,7 +1091,7 @@ async function handleQuery(req, res, next) {
     if (isAcknowledgementOnly(question) && !hasAnalyticsCue(question)) {
       const summary =
         fastSmallTalkResponse(question) ||
-        (await answerQuestion({ question, history: "" }));
+        (await answerQuestion({ question, history: "", messages: [] }));
       const payload = { sql: "", rows: [], summary, conversationId };
       rememberConversationTurn(conversationId, question, payload);
       return res.json(payload);
@@ -843,12 +1120,53 @@ async function handleQuery(req, res, next) {
       }
     }
 
+    if (conversationId && previousTurn && isPaymentsStatusFollowupQuestion(question)) {
+      const topic = topicFromLastTurn(previousTurn);
+      if (topic === "payments") {
+        const days = inferDaysFromTurn(previousTurn);
+        const sql = paymentsStatusBreakdownSql(days);
+        const rows = await runSelectWithTimeout(sql);
+        const summary = `Payment status breakdown for the last ${days} days.`;
+        const payload = { sql, rows, summary, conversationId };
+        rememberConversationTurn(conversationId, question, payload);
+        return res.json(payload);
+      }
+    }
+
     if (shouldUseSalesTrend30dPreset(question)) {
       const sql = salesTrend30dSql();
       const rows = await runSelectWithTimeout(sql);
       const summary =
         "Daily sales trend for the last 30 days (series_a=Web, series_b=POS).";
       const payload = { sql, rows, summary, conversationId };
+      rememberConversationTurn(conversationId, question, payload);
+      return res.json(payload);
+    }
+
+    if (shouldUsePaymentsTotalPreset(question)) {
+      const days = parseLastNDays(question) || 30;
+      const sql = paymentsTotalSql(days);
+      const rows = await runSelectWithTimeout(sql);
+      const summary = `Total succeeded payments for the last ${days} days.`;
+      const payload = { sql, rows, summary, conversationId };
+      rememberConversationTurn(conversationId, question, payload);
+      return res.json(payload);
+    }
+
+    const route = routeQuestion({ question, previousTurn });
+    if (route.mode === "clarify") {
+      const payload = { sql: "", rows: [], summary: route.message, conversationId };
+      rememberConversationTurn(conversationId, question, payload);
+      return res.json(payload);
+    }
+
+    if (route.mode === "chat") {
+      const summary = await answerQuestion({
+        question,
+        history,
+        messages: historyMsgs,
+      });
+      const payload = { sql: "", rows: [], summary, conversationId };
       rememberConversationTurn(conversationId, question, payload);
       return res.json(payload);
     }
@@ -890,6 +1208,22 @@ async function handleQuery(req, res, next) {
     const cleanedSql = stripCodeFences(rawSql);
     let safeSql = enforceLimit(assertSafeReadOnlySelect(cleanedSql), 200);
 
+    // If the generated SQL violates our business definitions (e.g. missing required status filters),
+    // repair it once before execution.
+    try {
+      const repairedRaw = await maybeRepairForBusinessRules({
+        schema,
+        question,
+        sql: safeSql,
+        outputHint,
+        history,
+      });
+      const repairedClean = stripCodeFences(repairedRaw);
+      safeSql = enforceLimit(assertSafeReadOnlySelect(repairedClean), 200);
+    } catch {
+      // If business-rule repair fails, fall back to executing the original safe SQL.
+    }
+
     let rows;
     try {
       rows = await runSelectWithTimeout(safeSql);
@@ -921,6 +1255,7 @@ async function handleQuery(req, res, next) {
         const summary = await answerQuestion({
           question: `The database rejected the generated SQL with this error: ${dbMessage}. Ask again with more details (e.g., “by store”, “last 30 days”), and I’ll try a different query.`,
           history,
+          messages: historyMsgs,
         });
         const payload = { sql: safeSql, rows: [], summary, conversationId };
         rememberConversationTurn(conversationId, question, payload);
@@ -955,7 +1290,11 @@ async function handleQuery(req, res, next) {
       // If the LLM produced invalid/unsafe SQL, fall back to a plain conversational answer
       // rather than failing the entire request. Never execute unsafe SQL.
       try {
-        const summary = await answerQuestion({ question, history });
+        const summary = await answerQuestion({
+          question,
+          history,
+          messages: historyMsgs,
+        });
         const payload = { sql: "", rows: [], summary, conversationId };
         rememberConversationTurn(conversationId, question, payload);
         return res.json(payload);
